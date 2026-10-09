@@ -1,0 +1,9 @@
+.git
+.gitignore
+.vs
+**/bin
+**/obj
+**/*.user
+.env
+.env.*
+**/appsettings*.json
