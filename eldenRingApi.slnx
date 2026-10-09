@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="eldenRingApi/eldenRingApi.csproj" />
+  <Project Path="migrationMongo/migrationMongo.csproj" />
+</Solution>
