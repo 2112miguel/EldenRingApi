@@ -7,6 +7,11 @@ using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 
 var options = MigrationOptions.Parse(args);
+if (!string.IsNullOrWhiteSpace(options.UpdatesFile))
+{
+    return await ApplyUpdatesAsync(options);
+}
+
 if (string.IsNullOrWhiteSpace(options.SourceDirectory) || !Directory.Exists(options.SourceDirectory))
 {
     Console.Error.WriteLine("Uso: dotnet run -- --source <directorio-csv> [--apply] [--database eldenring]");
@@ -68,6 +73,64 @@ foreach (var catalog in catalogs)
 }
 Console.WriteLine("Migración terminada correctamente.");
 return 0;
+
+static async Task<int> ApplyUpdatesAsync(MigrationOptions options)
+{
+    if (!File.Exists(options.UpdatesFile))
+    {
+        Console.Error.WriteLine("No se encontró el archivo de actualizaciones.");
+        return 1;
+    }
+
+    if (string.IsNullOrWhiteSpace(options.ConnectionString))
+    {
+        Console.Error.WriteLine("Falta MONGODB_CONNECTION_STRING o --connection-string.");
+        return 1;
+    }
+
+    var updates = JArray.Parse(await File.ReadAllTextAsync(options.UpdatesFile));
+    var allowedCollections = ImportSpecifications.All.Select(specification => specification.CollectionName).ToHashSet(StringComparer.OrdinalIgnoreCase);
+    var requested = updates.Select(token =>
+    {
+        var collection = token.Value<string>("collection") ?? throw new FormatException("Actualización sin collection.");
+        var id = token.Value<string>("id") ?? throw new FormatException("Actualización sin id.");
+        var set = token["set"] as JObject ?? throw new FormatException("Actualización sin set.");
+        if (!allowedCollections.Contains(collection)) throw new FormatException($"Colección no permitida: {collection}.");
+        if (!set.Properties().Any()) throw new FormatException($"Actualización vacía para {collection}/{id}.");
+        return new PendingUpdate(collection, id, set);
+    }).ToList();
+
+    var database = new MongoClient(options.ConnectionString).GetDatabase(options.DatabaseName);
+    foreach (var group in requested.GroupBy(update => update.Collection, StringComparer.OrdinalIgnoreCase))
+    {
+        var collection = database.GetCollection<BsonDocument>(group.Key);
+        var ids = group.Select(update => update.Id).Distinct(StringComparer.Ordinal).ToList();
+        var found = await collection.CountDocumentsAsync(Builders<BsonDocument>.Filter.In("_id", ids));
+        if (found != ids.Count)
+        {
+            Console.Error.WriteLine($"{group.Key}: se esperaban {ids.Count} IDs y MongoDB encontró {found}. No se aplicó ningún cambio.");
+            return 1;
+        }
+    }
+
+    var modified = 0L;
+    foreach (var group in requested.GroupBy(update => update.Collection, StringComparer.OrdinalIgnoreCase))
+    {
+        var collection = database.GetCollection<BsonDocument>(group.Key);
+        var operations = group.Select(update =>
+        {
+            var definitions = update.Set.Properties().Select(property => Builders<BsonDocument>.Update.Set(property.Name, ToBsonValue(property.Value))).ToList();
+            return new UpdateOneModel<BsonDocument>(Builders<BsonDocument>.Filter.Eq("_id", update.Id), Builders<BsonDocument>.Update.Combine(definitions));
+        });
+        var result = await collection.BulkWriteAsync(operations, new BulkWriteOptions { IsOrdered = true });
+        modified += result.ModifiedCount;
+        Console.WriteLine($"{group.Key}: {result.MatchedCount} coincidencias, {result.ModifiedCount} modificados.");
+    }
+    Console.WriteLine($"Actualización terminada: {requested.Count} documentos solicitados, {modified} modificados.");
+    return 0;
+}
+
+static BsonValue ToBsonValue(JToken token) => BsonDocument.Parse($"{{\"value\":{token.ToString(Formatting.None)}}}")["value"];
 
 static List<BsonDocument> ReadCsv(string path, ImportSpecification specification, List<string> errors)
 {
@@ -165,18 +228,21 @@ static class ImportSpecifications
     ];
 }
 
-sealed record MigrationOptions(string? SourceDirectory, bool Apply, string DatabaseName, string? ConnectionString)
+sealed record PendingUpdate(string Collection, string Id, JObject Set);
+
+sealed record MigrationOptions(string? SourceDirectory, bool Apply, string DatabaseName, string? ConnectionString, string? UpdatesFile)
 {
     public static MigrationOptions Parse(string[] arguments)
     {
-        string? source = null; var apply = false; var database = "eldenring"; var connection = Environment.GetEnvironmentVariable("MONGODB_CONNECTION_STRING");
+        string? source = null; string? updatesFile = null; var apply = false; var database = "eldenring"; var connection = Environment.GetEnvironmentVariable("MONGODB_CONNECTION_STRING");
         for (var i = 0; i < arguments.Length; i++)
         {
             if (arguments[i] == "--apply") apply = true;
             else if (arguments[i] == "--source" && i + 1 < arguments.Length) source = arguments[++i];
             else if (arguments[i] == "--database" && i + 1 < arguments.Length) database = arguments[++i];
             else if (arguments[i] == "--connection-string" && i + 1 < arguments.Length) connection = arguments[++i];
+            else if (arguments[i] == "--updates-file" && i + 1 < arguments.Length) updatesFile = arguments[++i];
         }
-        return new MigrationOptions(source, apply, database, connection);
+        return new MigrationOptions(source, apply, database, connection, updatesFile);
     }
 }
