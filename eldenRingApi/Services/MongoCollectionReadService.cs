@@ -1,13 +1,14 @@
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 using eldenRingApi.Contracts;
+using eldenRingApi.Interfaces;
 using MongoDB.Bson;
 using MongoDB.Bson.IO;
 using MongoDB.Driver;
 
 namespace eldenRingApi.Services;
 
-public abstract class MongoCollectionReadService(IMongoDatabase database)
+public abstract class MongoCollectionReadService(IMongoDatabase database, IRecordRelationshipResolver relationshipResolver)
 {
     protected async Task<EntityPage> GetPageAsync(string collectionName, CollectionQuery query, CancellationToken cancellationToken)
     {
@@ -24,14 +25,19 @@ public abstract class MongoCollectionReadService(IMongoDatabase database)
             .Skip(query.Page * query.Limit)
             .Limit(query.Limit)
             .ToListAsync(cancellationToken);
-        return new EntityPage(total, documents.Select(ToApiDocument).ToList());
+        var items = documents.Select(ToApiDocument).ToList();
+        await relationshipResolver.PopulateAsync(items, cancellationToken);
+        return new EntityPage(total, items);
     }
 
     protected async Task<JsonObject?> GetByIdAsync(string collectionName, string id, CancellationToken cancellationToken)
     {
         var collection = database.GetCollection<BsonDocument>(collectionName);
         var document = await collection.Find(Builders<BsonDocument>.Filter.Eq("_id", id)).FirstOrDefaultAsync(cancellationToken);
-        return document is null ? null : ToApiDocument(document);
+        if (document is null) return null;
+        var item = ToApiDocument(document);
+        await relationshipResolver.PopulateAsync(item, cancellationToken);
+        return item;
     }
 
     private static JsonObject ToApiDocument(BsonDocument document)

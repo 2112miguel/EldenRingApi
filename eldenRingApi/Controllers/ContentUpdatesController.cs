@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using eldenRingApi.Interfaces;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using MongoDB.Bson;
@@ -11,7 +12,7 @@ namespace eldenRingApi.Controllers;
 [ApiController]
 [Route("api")]
 [Authorize(Policy = "AdminWrite")]
-public sealed class ContentUpdatesController(IMongoDatabase database) : ControllerBase
+public sealed class ContentUpdatesController(IMongoDatabase database, IRecordRelationshipResolver relationshipResolver) : ControllerBase
 {
     private static readonly HashSet<string> AllowedCollections = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -34,7 +35,7 @@ public sealed class ContentUpdatesController(IMongoDatabase database) : Controll
         var updates = new List<UpdateDefinition<BsonDocument>>();
         foreach (var (field, value) in changes)
         {
-            if (string.IsNullOrWhiteSpace(field) || field is "id" or "_id" || field.Contains('.') || field.StartsWith('$'))
+            if (string.IsNullOrWhiteSpace(field) || field is "id" or "_id" or "location" or "drops" || field.Contains('.') || field.StartsWith('$'))
                 return BadRequest(new { success = false, error = $"'{field}' cannot be updated." });
 
             if (value is JsonArray or JsonObject)
@@ -52,6 +53,7 @@ public sealed class ContentUpdatesController(IMongoDatabase database) : Controll
         if (result.MatchedCount == 0)
             return NotFound(new { success = false, error = "Document not found." });
 
+        if (changes.ContainsKey("name")) relationshipResolver.Invalidate();
         return Ok(new { success = true, id, modified = result.ModifiedCount > 0, updatedFields = changes.Select(field => field.Key) });
     }
 

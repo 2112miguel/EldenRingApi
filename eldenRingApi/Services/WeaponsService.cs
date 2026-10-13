@@ -5,7 +5,7 @@ using MongoDB.Driver;
 
 namespace eldenRingApi.Services;
 
-public sealed class WeaponsService(IMongoDatabase database) : MongoCollectionReadService(database), IWeaponsService
+public sealed class WeaponsService(IMongoDatabase database, IRecordRelationshipResolver relationshipResolver) : MongoCollectionReadService(database, relationshipResolver), IWeaponsService
 {
     public Task<EntityPage> GetAllAsync(CollectionQuery query, CancellationToken cancellationToken) =>
         GetPageAsync("weapons", query, cancellationToken);

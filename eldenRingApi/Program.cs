@@ -20,6 +20,7 @@ var mongoDatabaseName = builder.Configuration["MongoDb:DatabaseName"] ?? "eldenr
 
 builder.Services.AddControllers();
 builder.Services.AddOpenApi();
+builder.Services.AddMemoryCache();
 var configuredJwtKey = builder.Configuration["Jwt:Key"];
 var jwtKey = string.IsNullOrWhiteSpace(configuredJwtKey)
     ? Convert.ToBase64String(RandomNumberGenerator.GetBytes(32))
@@ -75,6 +76,7 @@ builder.Services.AddSingleton<IMongoClient>(_ => new MongoClient(mongoConnection
 builder.Services.AddSingleton<IMongoDatabase>(serviceProvider =>
     serviceProvider.GetRequiredService<IMongoClient>().GetDatabase(mongoDatabaseName));
 builder.Services.AddScoped<IAuthService, AuthService>();
+builder.Services.AddSingleton<IRecordRelationshipResolver, RecordRelationshipResolver>();
 builder.Services.AddHostedService<BootstrapAdminService>();
 builder.Services.AddScoped<IWeaponsService, WeaponsService>();
 builder.Services.AddScoped<IBossesService, BossesService>();

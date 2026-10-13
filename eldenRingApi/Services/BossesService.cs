@@ -5,7 +5,7 @@ using MongoDB.Driver;
 
 namespace eldenRingApi.Services;
 
-public sealed class BossesService(IMongoDatabase database) : MongoCollectionReadService(database), IBossesService
+public sealed class BossesService(IMongoDatabase database, IRecordRelationshipResolver relationshipResolver) : MongoCollectionReadService(database, relationshipResolver), IBossesService
 {
     public Task<EntityPage> GetAllAsync(CollectionQuery query, CancellationToken cancellationToken) =>
         GetPageAsync("bosses", query, cancellationToken);
