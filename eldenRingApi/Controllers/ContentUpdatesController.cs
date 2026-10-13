@@ -4,11 +4,12 @@ using eldenRingApi.Interfaces;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using MongoDB.Bson;
+using MongoDB.Bson.IO;
 using MongoDB.Driver;
 
 namespace eldenRingApi.Controllers;
 
-/// <summary>Admin-only partial updates for existing game content.</summary>
+/// <summary>Admin-only creation and partial updates for game content.</summary>
 [ApiController]
 [Route("api")]
 [Authorize(Policy = "AdminWrite")]
@@ -19,6 +20,38 @@ public sealed class ContentUpdatesController(IMongoDatabase database, IRecordRel
         "ammos", "armors", "ashes", "bosses", "classes", "creatures", "incantations",
         "items", "locations", "npcs", "shields", "sorceries", "spirits", "talismans", "weapons"
     };
+
+    [HttpPost("{collection}")]
+    public async Task<IActionResult> Create(string collection, [FromBody] JsonObject? payload, CancellationToken cancellationToken)
+    {
+        if (!AllowedCollections.Contains(collection))
+            return NotFound(new { success = false, error = "Collection not found." });
+        if (payload is null || payload.Count == 0)
+            return BadRequest(new { success = false, error = "Provide the record fields to create." });
+        if (payload.ContainsKey("id") || payload.ContainsKey("_id"))
+            return BadRequest(new { success = false, error = "The server generates the id." });
+        if (payload.ContainsKey("location") || payload.ContainsKey("drops"))
+            return BadRequest(new { success = false, error = "location and drops are managed through relationship endpoints." });
+
+        var document = BsonDocument.Parse(payload.ToJsonString());
+        if (!document.TryGetValue("name", out var name) || !name.IsString || string.IsNullOrWhiteSpace(name.AsString))
+            return BadRequest(new { success = false, error = "A non-empty name is required." });
+        if (HasUnsafeFieldName(document))
+            return BadRequest(new { success = false, error = "Field names cannot contain '.' or begin with '$'." });
+
+        var id = ObjectId.GenerateNewId().ToString();
+        document.InsertAt(0, new BsonElement("_id", id));
+        document["createdAt"] = DateTime.UtcNow;
+        document["updatedAt"] = DateTime.UtcNow;
+
+        await database.GetCollection<BsonDocument>(collection.ToLowerInvariant())
+            .InsertOneAsync(document, cancellationToken: cancellationToken);
+        relationshipResolver.Invalidate();
+
+        var result = ToApiDocument(document);
+        await relationshipResolver.PopulateAsync(result, cancellationToken);
+        return Created($"/api/{collection.ToLowerInvariant()}/{id}", new { success = true, id, data = result });
+    }
 
     [HttpPatch("{collection}/{id}")]
     public async Task<IActionResult> Update(string collection, string id, [FromBody] JsonObject? changes, CancellationToken cancellationToken)
@@ -73,5 +106,21 @@ public sealed class ContentUpdatesController(IMongoDatabase database, IRecordRel
             JsonValueKind.Null => BsonNull.Value,
             _ => throw new InvalidOperationException("Only scalar JSON values are supported.")
         };
+    }
+
+    private static bool HasUnsafeFieldName(BsonValue value) => value switch
+    {
+        BsonDocument document => document.Elements.Any(element => element.Name.Contains('.') || element.Name.StartsWith('$') || HasUnsafeFieldName(element.Value)),
+        BsonArray array => array.Any(HasUnsafeFieldName),
+        _ => false
+    };
+
+    private static JsonObject ToApiDocument(BsonDocument document)
+    {
+        var json = JsonNode.Parse(document.ToJson(new JsonWriterSettings { OutputMode = JsonOutputMode.RelaxedExtendedJson }))!.AsObject();
+        var id = json["_id"];
+        json.Remove("_id");
+        json["id"] = id;
+        return json;
     }
 }

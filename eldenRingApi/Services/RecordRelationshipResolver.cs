@@ -11,6 +11,7 @@ namespace eldenRingApi.Services;
 public sealed class RecordRelationshipResolver(IMongoDatabase database, IMemoryCache cache) : IRecordRelationshipResolver
 {
     private const string CacheKey = "record-relationship-index";
+    private static readonly SemaphoreSlim IndexBuildLock = new(1, 1);
     private static readonly string[] RelatedCollections =
     [
         "bosses", "creatures", "weapons", "ammos", "armors", "shields", "talismans",
@@ -32,13 +33,27 @@ public sealed class RecordRelationshipResolver(IMongoDatabase database, IMemoryC
 
     private async Task<RelationshipIndex> GetIndexAsync(CancellationToken cancellationToken)
     {
-        var cached = await cache.GetOrCreateAsync(CacheKey, async entry =>
+        if (cache.TryGetValue<RelationshipIndex>(CacheKey, out var cached)) return cached!;
+
+        await IndexBuildLock.WaitAsync(cancellationToken);
+        try
         {
-            entry.AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(5);
-            var indexes = await Task.WhenAll(RelatedCollections.Select(collection => LoadCollectionAsync(collection, cancellationToken)));
-            return new RelationshipIndex(indexes.SelectMany(values => values));
-        });
-        return cached!;
+            if (cache.TryGetValue<RelationshipIndex>(CacheKey, out cached)) return cached!;
+
+            // Atlas free/shared tiers can have a small connection pool. Load one collection at a time
+            // and ensure concurrent requests share the same index build.
+            var records = new List<RelatedRecord>();
+            foreach (var collection in RelatedCollections)
+                records.AddRange(await LoadCollectionAsync(collection, cancellationToken));
+
+            var index = new RelationshipIndex(records);
+            cache.Set(CacheKey, index, TimeSpan.FromMinutes(5));
+            return index;
+        }
+        finally
+        {
+            IndexBuildLock.Release();
+        }
     }
 
     private async Task<IEnumerable<RelatedRecord>> LoadCollectionAsync(string collectionName, CancellationToken cancellationToken)

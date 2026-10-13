@@ -5,6 +5,7 @@ using Microsoft.AspNetCore.Authorization;
 using Microsoft.IdentityModel.Tokens;
 using System.Security.Cryptography;
 using System.Security.Claims;
+using System.Diagnostics;
 using MongoDB.Bson;
 using MongoDB.Driver;
 using System.Text;
@@ -101,6 +102,50 @@ if (app.Environment.IsDevelopment())
 {
     app.MapOpenApi();
 }
+
+// Keep request diagnostics in local console logs and Azure App Service logs.
+app.Use(async (context, next) =>
+{
+    var stopwatch = Stopwatch.StartNew();
+    await next();
+    stopwatch.Stop();
+    app.Logger.LogInformation(
+        "HTTP {Method} {Path} responded {StatusCode} in {ElapsedMilliseconds} ms. TraceId: {TraceId}",
+        context.Request.Method,
+        context.Request.Path,
+        context.Response.StatusCode,
+        stopwatch.ElapsedMilliseconds,
+        context.TraceIdentifier);
+});
+
+// Return a consistent safe response while preserving the exception details in server logs.
+app.Use(async (context, next) =>
+{
+    try
+    {
+        await next();
+    }
+    catch (Exception exception)
+    {
+        app.Logger.LogError(
+            exception,
+            "Unhandled exception for HTTP {Method} {Path}. TraceId: {TraceId}",
+            context.Request.Method,
+            context.Request.Path,
+            context.TraceIdentifier);
+
+        if (context.Response.HasStarted) throw;
+
+        context.Response.Clear();
+        context.Response.StatusCode = StatusCodes.Status500InternalServerError;
+        await context.Response.WriteAsJsonAsync(new
+        {
+            success = false,
+            error = "An unexpected server error occurred.",
+            traceId = context.TraceIdentifier
+        });
+    }
+});
 
 app.UseHttpsRedirection();
 
