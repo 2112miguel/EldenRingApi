@@ -4,6 +4,8 @@ using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.IdentityModel.Tokens;
 using System.Security.Cryptography;
+using System.Security.Claims;
+using MongoDB.Bson;
 using MongoDB.Driver;
 using System.Text;
 
@@ -25,16 +27,41 @@ var jwtKey = string.IsNullOrWhiteSpace(configuredJwtKey)
 var jwtIssuer = builder.Configuration["Jwt:Issuer"] ?? "elden-ring-api";
 var jwtAudience = builder.Configuration["Jwt:Audience"] ?? "elden-ring-admin";
 builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
-    .AddJwtBearer(options => options.TokenValidationParameters = new TokenValidationParameters
+    .AddJwtBearer(options =>
     {
-        ValidateIssuerSigningKey = true,
-        IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtKey)),
-        ValidateIssuer = true,
-        ValidIssuer = jwtIssuer,
-        ValidateAudience = true,
-        ValidAudience = jwtAudience,
-        ValidateLifetime = true,
-        ClockSkew = TimeSpan.FromMinutes(1)
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuerSigningKey = true,
+            IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtKey)),
+            ValidateIssuer = true,
+            ValidIssuer = jwtIssuer,
+            ValidateAudience = true,
+            ValidAudience = jwtAudience,
+            ValidateLifetime = true,
+            ClockSkew = TimeSpan.FromMinutes(1)
+        };
+        options.Events = new JwtBearerEvents
+        {
+            OnTokenValidated = async context =>
+            {
+                var email = context.Principal?.FindFirst(ClaimTypes.Email)?.Value;
+                var versionText = context.Principal?.FindFirst("tokenVersion")?.Value;
+                if (string.IsNullOrWhiteSpace(email) || !int.TryParse(versionText, out var tokenVersion))
+                {
+                    context.Fail("Invalid account token.");
+                    return;
+                }
+
+                var database = context.HttpContext.RequestServices.GetRequiredService<IMongoDatabase>();
+                var users = database.GetCollection<BsonDocument>("users");
+                var user = await users.Find(Builders<BsonDocument>.Filter.Eq("_id", email)).FirstOrDefaultAsync(context.HttpContext.RequestAborted);
+                var currentVersion = user is not null && user.TryGetValue("tokenVersion", out var storedVersion) && storedVersion.IsNumeric
+                    ? storedVersion.ToInt32()
+                    : 0;
+                if (user is null || !user.GetValue("isActive", false).ToBoolean() || currentVersion != tokenVersion)
+                    context.Fail("The account token is no longer valid.");
+            }
+        };
     });
 builder.Services.AddAuthorization(options =>
 {

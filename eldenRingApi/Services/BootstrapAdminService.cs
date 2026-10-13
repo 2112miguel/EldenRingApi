@@ -30,6 +30,7 @@ public sealed class BootstrapAdminService(IConfiguration configuration, IMongoDa
             { "passwordHash", BCrypt.Net.BCrypt.HashPassword(password) },
             { "roles", new BsonArray { "admin" } },
             { "isActive", true },
+            { "tokenVersion", 0 },
             { "createdAt", DateTime.UtcNow }
         };
         await users.InsertOneAsync(user, cancellationToken: cancellationToken);
