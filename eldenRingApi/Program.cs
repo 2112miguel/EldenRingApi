@@ -79,6 +79,7 @@ builder.Services.AddSingleton<IMongoDatabase>(serviceProvider =>
 builder.Services.AddScoped<IAuthService, AuthService>();
 builder.Services.AddSingleton<IRecordRelationshipResolver, RecordRelationshipResolver>();
 builder.Services.AddHostedService<BootstrapAdminService>();
+builder.Services.AddHostedService<GuideIndexService>();
 builder.Services.AddScoped<IWeaponsService, WeaponsService>();
 builder.Services.AddScoped<IBossesService, BossesService>();
 builder.Services.AddScoped<IAmmosService, AmmosService>();

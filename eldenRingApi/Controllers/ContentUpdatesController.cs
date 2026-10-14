@@ -49,7 +49,7 @@ public sealed class ContentUpdatesController(IMongoDatabase database, IRecordRel
         relationshipResolver.Invalidate();
 
         var result = ToApiDocument(document);
-        await relationshipResolver.PopulateAsync(result, cancellationToken);
+        await relationshipResolver.PopulateAsync(result, collection, cancellationToken);
         return Created($"/api/{collection.ToLowerInvariant()}/{id}", new { success = true, id, data = result });
     }
 

@@ -20,14 +20,14 @@ public sealed class RecordRelationshipResolver(IMongoDatabase database, IMemoryC
     private static readonly Regex CurrencyPattern = new(@"^\s*(?:\d[\d\s,.]*|\?+)\s+runes?\s*$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
     private static readonly Regex QuotedValuePattern = new("(?:\"(?<double>(?:\\\\.|[^\"])*)\"|'(?<single>(?:\\\\.|[^'])*)')", RegexOptions.CultureInvariant);
 
-    public async Task PopulateAsync(IEnumerable<JsonObject> records, CancellationToken cancellationToken)
+    public async Task PopulateAsync(IEnumerable<JsonObject> records, string collectionName, CancellationToken cancellationToken)
     {
         var index = await GetIndexAsync(cancellationToken);
-        foreach (var record in records) Populate(record, index);
+        foreach (var record in records) Populate(record, collectionName, index);
     }
 
-    public async Task PopulateAsync(JsonObject record, CancellationToken cancellationToken) =>
-        Populate(record, await GetIndexAsync(cancellationToken));
+    public async Task PopulateAsync(JsonObject record, string collectionName, CancellationToken cancellationToken) =>
+        Populate(record, collectionName, await GetIndexAsync(cancellationToken));
 
     public void Invalidate() => cache.Remove(CacheKey);
 
@@ -46,7 +46,8 @@ public sealed class RecordRelationshipResolver(IMongoDatabase database, IMemoryC
             foreach (var collection in RelatedCollections)
                 records.AddRange(await LoadCollectionAsync(collection, cancellationToken));
 
-            var index = new RelationshipIndex(records);
+            var guides = await LoadPublishedGuideSummariesAsync(cancellationToken);
+            var index = new RelationshipIndex(records, guides);
             cache.Set(CacheKey, index, TimeSpan.FromMinutes(5));
             return index;
         }
@@ -68,8 +69,29 @@ public sealed class RecordRelationshipResolver(IMongoDatabase database, IMemoryC
             .Select(document => new RelatedRecord(collectionName, document["_id"].AsString, document["name"].AsString));
     }
 
-    private static void Populate(JsonObject record, RelationshipIndex index)
+    private async Task<IEnumerable<GuideSummary>> LoadPublishedGuideSummariesAsync(CancellationToken cancellationToken)
     {
+        var projection = Builders<BsonDocument>.Projection.Include("_id").Include("subject").Include("title").Include("status");
+        var documents = await database.GetCollection<BsonDocument>("guides")
+            .Find(Builders<BsonDocument>.Filter.Eq("status", "published"))
+            .Project<BsonDocument>(projection)
+            .ToListAsync(cancellationToken);
+        return documents.Where(document =>
+                document.TryGetValue("_id", out var id) && id.IsString &&
+                document.TryGetValue("title", out var title) && title.IsString &&
+                document.TryGetValue("subject", out var subject) && subject.IsBsonDocument &&
+                subject.AsBsonDocument.TryGetValue("collection", out var collection) && collection.IsString &&
+                subject.AsBsonDocument.TryGetValue("id", out var recordId) && recordId.IsString)
+            .Select(document => new GuideSummary(document["_id"].AsString, document["subject"].AsBsonDocument["collection"].AsString, document["subject"].AsBsonDocument["id"].AsString, document["title"].AsString));
+    }
+
+    private static void Populate(JsonObject record, string collectionName, RelationshipIndex index)
+    {
+        var recordId = ReadString(record["id"]);
+        record["guide"] = recordId is not null && index.TryFindGuide(collectionName, recordId, out var guide)
+            ? new JsonObject { ["id"] = guide.Id, ["title"] = guide.Title, ["status"] = "published" }
+            : null;
+
         if (!record.ContainsKey("guideUrl"))
             record["guideUrl"] = ReadString(record["fextralifePageUrl"]);
 
@@ -128,8 +150,9 @@ public sealed class RecordRelationshipResolver(IMongoDatabase database, IMemoryC
     private static string Normalize(string value) => Regex.Replace(value.Trim(), "\\s+", " ");
 
     private sealed record RelatedRecord(string Collection, string Id, string Name);
+    private sealed record GuideSummary(string Id, string Collection, string RecordId, string Title);
 
-    private sealed class RelationshipIndex(IEnumerable<RelatedRecord> records)
+    private sealed class RelationshipIndex(IEnumerable<RelatedRecord> records, IEnumerable<GuideSummary> guides)
     {
         private readonly Dictionary<string, RelatedRecord> _locations = records
             .Where(record => record.Collection == "locations")
@@ -140,7 +163,13 @@ public sealed class RecordRelationshipResolver(IMongoDatabase database, IMemoryC
             .GroupBy(record => Normalize(record.Name), StringComparer.OrdinalIgnoreCase)
             .ToDictionary(group => group.Key, group => group.First(), StringComparer.OrdinalIgnoreCase);
 
+        private readonly Dictionary<string, GuideSummary> _guides = guides
+            .GroupBy(guide => Key(guide.Collection, guide.RecordId), StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(group => group.Key, group => group.First(), StringComparer.OrdinalIgnoreCase);
+
         public bool TryFindLocation(string name, out RelatedRecord record) => _locations.TryGetValue(Normalize(name), out record!);
         public bool TryFindRecord(string name, out RelatedRecord record) => _records.TryGetValue(Normalize(name), out record!);
+        public bool TryFindGuide(string collection, string id, out GuideSummary guide) => _guides.TryGetValue(Key(collection, id), out guide!);
+        private static string Key(string collection, string id) => $"{collection.Trim().ToLowerInvariant()}:{id}";
     }
 }

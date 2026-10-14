@@ -26,7 +26,7 @@ public abstract class MongoCollectionReadService(IMongoDatabase database, IRecor
             .Limit(query.Limit)
             .ToListAsync(cancellationToken);
         var items = documents.Select(ToApiDocument).ToList();
-        await relationshipResolver.PopulateAsync(items, cancellationToken);
+        await relationshipResolver.PopulateAsync(items, collectionName, cancellationToken);
         return new EntityPage(total, items);
     }
 
@@ -36,7 +36,7 @@ public abstract class MongoCollectionReadService(IMongoDatabase database, IRecor
         var document = await collection.Find(Builders<BsonDocument>.Filter.Eq("_id", id)).FirstOrDefaultAsync(cancellationToken);
         if (document is null) return null;
         var item = ToApiDocument(document);
-        await relationshipResolver.PopulateAsync(item, cancellationToken);
+        await relationshipResolver.PopulateAsync(item, collectionName, cancellationToken);
         return item;
     }
 
