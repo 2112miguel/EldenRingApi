@@ -21,7 +21,17 @@ public sealed class GuidesController(IMongoDatabase database, IRecordRelationshi
     public async Task<IActionResult> GetPublished(string collection, string recordId, CancellationToken cancellationToken)
     {
         var guide = await Guides.Find(PublishedSubjectFilter(collection, recordId)).FirstOrDefaultAsync(cancellationToken);
-        return guide is null ? NotFound(new { success = false }) : Ok(new { success = true, data = ToJson(guide) });
+        return guide is null ? NotFound(new { success = false }) : Ok(new { success = true, data = await ToEnrichedJsonAsync(guide, cancellationToken) });
+    }
+
+    [HttpGet("{guideId}")]
+    public async Task<IActionResult> GetPublishedById(string guideId, CancellationToken cancellationToken)
+    {
+        var filter = Builders<BsonDocument>.Filter.And(
+            Builders<BsonDocument>.Filter.Eq("_id", guideId),
+            Builders<BsonDocument>.Filter.Eq("status", "published"));
+        var guide = await Guides.Find(filter).FirstOrDefaultAsync(cancellationToken);
+        return guide is null ? NotFound(new { success = false }) : Ok(new { success = true, data = await ToEnrichedJsonAsync(guide, cancellationToken) });
     }
 
     [HttpGet]
@@ -38,23 +48,20 @@ public sealed class GuidesController(IMongoDatabase database, IRecordRelationshi
             .Sort(Builders<BsonDocument>.Sort.Descending("updatedAt"))
             .Skip(page * limit)
             .Limit(limit)
-            .Project<BsonDocument>(Builders<BsonDocument>.Projection.Include("_id").Include("title").Include("summary").Include("status").Include("subject").Include("updatedAt"))
+            .Project<BsonDocument>(Builders<BsonDocument>.Projection.Include("_id").Include("title").Include("summary").Include("status").Include("subject").Include("media").Include("updatedAt"))
             .ToListAsync(cancellationToken);
 
         var data = new List<object>();
         foreach (var guide in guides)
         {
-            object? subjectPayload = null;
+            JsonObject? subjectPayload = null;
             if (guide.TryGetValue("subject", out var subjectValue) && subjectValue.IsBsonDocument)
             {
                 var subject = subjectValue.AsBsonDocument;
                 var collection = subject["collection"].AsString;
                 var recordId = subject["id"].AsString;
-                var record = await database.GetCollection<BsonDocument>(collection)
-                    .Find(Builders<BsonDocument>.Filter.Eq("_id", recordId))
-                    .Project<BsonDocument>(Builders<BsonDocument>.Projection.Include("name"))
-                    .FirstOrDefaultAsync(cancellationToken);
-                subjectPayload = new { collection, id = recordId, name = record?.GetValue("name", string.Empty).AsString ?? string.Empty };
+                subjectPayload = new JsonObject { ["collection"] = collection, ["id"] = recordId };
+                await EnrichReferenceAsync(subjectPayload, cancellationToken);
             }
 
             data.Add(new
@@ -64,6 +71,8 @@ public sealed class GuidesController(IMongoDatabase database, IRecordRelationshi
                 summary = guide.TryGetValue("summary", out var summary) && summary.IsString ? summary.AsString : null,
                 status = "published",
                 subject = subjectPayload,
+                media = ToJsonArray(guide.GetValue("media", new BsonArray())),
+                coverImage = GetCoverImage(guide),
                 updatedAt = guide.GetValue("updatedAt", BsonDateTime.Create(DateTime.UnixEpoch)).ToUniversalTime()
             });
         }
@@ -136,7 +145,7 @@ public sealed class GuidesController(IMongoDatabase database, IRecordRelationshi
         var resourceUrl = request.Subject is null
             ? $"/api/guides/admin/{id}"
             : $"/api/guides/{request.Subject.Collection!.ToLowerInvariant()}/{request.Subject.Id}";
-        return Created(resourceUrl, new { success = true, id, data = ToJson(document) });
+        return Created(resourceUrl, new { success = true, id, data = await ToEnrichedJsonAsync(document, cancellationToken) });
     }
 
     [Authorize(Policy = "AdminWrite"), HttpPatch("{id}")]
@@ -149,7 +158,7 @@ public sealed class GuidesController(IMongoDatabase database, IRecordRelationshi
         var replacement = ToDocument(id, request, existing.GetValue("createdAt", BsonDateTime.Create(DateTime.UtcNow)));
         await Guides.ReplaceOneAsync(Builders<BsonDocument>.Filter.Eq("_id", id), replacement, cancellationToken: cancellationToken);
         relationshipResolver.Invalidate();
-        return Ok(new { success = true, id, data = ToJson(replacement) });
+        return Ok(new { success = true, id, data = await ToEnrichedJsonAsync(replacement, cancellationToken) });
     }
 
     private IMongoCollection<BsonDocument> Guides => database.GetCollection<BsonDocument>("guides");
@@ -225,11 +234,76 @@ public sealed class GuidesController(IMongoDatabase database, IRecordRelationshi
     };
 
     private static BsonDocument ReferenceDocument(GuideReference reference) => new() { { "collection", reference.Collection!.Trim().ToLowerInvariant() }, { "id", reference.Id!.Trim() } };
+
+    private async Task<JsonObject> ToEnrichedJsonAsync(BsonDocument document, CancellationToken cancellationToken)
+    {
+        var guide = ToJson(document);
+        await EnrichReferenceAsync(guide["subject"] as JsonObject, cancellationToken);
+
+        if (guide["sections"] is JsonArray sections)
+            foreach (var section in sections.OfType<JsonObject>())
+            {
+                await EnrichReferencesAsync(section["references"] as JsonArray, cancellationToken);
+                if (section["subsections"] is JsonArray subsections)
+                    foreach (var subsection in subsections.OfType<JsonObject>())
+                        await EnrichReferencesAsync(subsection["references"] as JsonArray, cancellationToken);
+            }
+        if (guide["supplements"] is JsonArray supplements)
+            foreach (var supplement in supplements.OfType<JsonObject>())
+                await EnrichReferencesAsync(supplement["references"] as JsonArray, cancellationToken);
+
+        guide["coverImage"] = GetCoverImage(document);
+        return guide;
+    }
+
+    private async Task EnrichReferencesAsync(JsonArray? references, CancellationToken cancellationToken)
+    {
+        if (references is null) return;
+        foreach (var reference in references.OfType<JsonObject>())
+            await EnrichReferenceAsync(reference, cancellationToken);
+    }
+
+    private async Task EnrichReferenceAsync(JsonObject? reference, CancellationToken cancellationToken)
+    {
+        if (reference is null ||
+            reference["collection"] is not JsonValue collectionValue ||
+            reference["id"] is not JsonValue idValue ||
+            !collectionValue.TryGetValue<string>(out var collection) ||
+            !idValue.TryGetValue<string>(out var id) ||
+            string.IsNullOrWhiteSpace(collection) || string.IsNullOrWhiteSpace(id) ||
+            !ContentCollections.Contains(collection)) return;
+
+        var record = await database.GetCollection<BsonDocument>(collection.ToLowerInvariant())
+            .Find(Builders<BsonDocument>.Filter.Eq("_id", id))
+            .Project<BsonDocument>(Builders<BsonDocument>.Projection.Include("name").Include("image"))
+            .FirstOrDefaultAsync(cancellationToken);
+        reference["name"] = record is not null && record.TryGetValue("name", out var name) && name.IsString ? name.AsString : null;
+        reference["image"] = record is not null && record.TryGetValue("image", out var image) && image.IsString ? image.AsString : null;
+    }
+
+    private static string? GetCoverImage(BsonDocument guide)
+    {
+        if (!guide.TryGetValue("media", out var media) || !media.IsBsonArray) return null;
+        return media.AsBsonArray
+            .Where(value => value.IsBsonDocument)
+            .Select(value => value.AsBsonDocument.GetValue("url", BsonNull.Value))
+            .FirstOrDefault(url => url.IsString && !string.IsNullOrWhiteSpace(url.AsString))?.AsString;
+    }
+
+    private static JsonArray ToJsonArray(BsonValue value) => JsonNode.Parse(value.ToJson(new JsonWriterSettings { OutputMode = JsonOutputMode.RelaxedExtendedJson }))!.AsArray();
     private static JsonObject ToJson(BsonDocument document)
     {
         var json = JsonNode.Parse(document.ToJson(new JsonWriterSettings { OutputMode = JsonOutputMode.RelaxedExtendedJson }))!.AsObject();
         json["id"] = json["_id"]?.DeepClone();
         json.Remove("_id");
+        SetIsoDate(json, document, "createdAt");
+        SetIsoDate(json, document, "updatedAt");
         return json;
+    }
+
+    private static void SetIsoDate(JsonObject json, BsonDocument document, string field)
+    {
+        if (document.TryGetValue(field, out var value) && value.IsValidDateTime)
+            json[field] = value.ToUniversalTime().ToString("O");
     }
 }

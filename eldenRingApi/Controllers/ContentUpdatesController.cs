@@ -1,8 +1,11 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Security.Claims;
+using eldenRingApi.Contracts;
 using eldenRingApi.Interfaces;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
 using MongoDB.Bson;
 using MongoDB.Bson.IO;
 using MongoDB.Driver;
@@ -88,6 +91,53 @@ public sealed class ContentUpdatesController(IMongoDatabase database, IRecordRel
 
         if (changes.ContainsKey("name")) relationshipResolver.Invalidate();
         return Ok(new { success = true, id, modified = result.ModifiedCount > 0, updatedFields = changes.Select(field => field.Key) });
+    }
+
+    [HttpDelete("{collection}/{id}")]
+    [EnableRateLimiting("record-delete")]
+    public async Task<IActionResult> Delete(string collection, string id, [FromBody] DeleteRecordRequest? request, CancellationToken cancellationToken)
+    {
+        if (!AllowedCollections.Contains(collection))
+            return NotFound(new { success = false, error = "Collection not found." });
+        if (string.IsNullOrWhiteSpace(id))
+            return BadRequest(new { success = false, error = "An id is required." });
+
+        var mongoCollection = database.GetCollection<BsonDocument>(collection.ToLowerInvariant());
+        var record = await mongoCollection.Find(Builders<BsonDocument>.Filter.Eq("_id", id)).FirstOrDefaultAsync(cancellationToken);
+        if (record is null)
+            return NotFound(new { success = false, error = "Document not found." });
+
+        var expectedConfirmation = $"DELETE {record.GetValue("name", string.Empty).AsString} [{id}]";
+        if (!string.Equals(request?.Confirmation, expectedConfirmation, StringComparison.Ordinal))
+            return BadRequest(new { success = false, error = "Confirmation must exactly match the requested record." });
+
+        var normalizedCollection = collection.ToLowerInvariant();
+        var referenceFilter = Builders<BsonDocument>.Filter.Or(
+            Builders<BsonDocument>.Filter.And(Builders<BsonDocument>.Filter.Eq("subject.collection", normalizedCollection), Builders<BsonDocument>.Filter.Eq("subject.id", id)),
+            Builders<BsonDocument>.Filter.And(Builders<BsonDocument>.Filter.Eq("sections.references.collection", normalizedCollection), Builders<BsonDocument>.Filter.Eq("sections.references.id", id)),
+            Builders<BsonDocument>.Filter.And(Builders<BsonDocument>.Filter.Eq("sections.subsections.references.collection", normalizedCollection), Builders<BsonDocument>.Filter.Eq("sections.subsections.references.id", id)),
+            Builders<BsonDocument>.Filter.And(Builders<BsonDocument>.Filter.Eq("supplements.references.collection", normalizedCollection), Builders<BsonDocument>.Filter.Eq("supplements.references.id", id)));
+        if (await database.GetCollection<BsonDocument>("guides").Find(referenceFilter).AnyAsync(cancellationToken))
+            return Conflict(new { success = false, error = "This record is referenced by a guide and cannot be deleted." });
+
+        var deletedBy = User.FindFirstValue(ClaimTypes.Email) ?? "unknown";
+        var archive = new BsonDocument
+        {
+            { "_id", ObjectId.GenerateNewId().ToString() },
+            { "originalCollection", normalizedCollection },
+            { "originalId", id },
+            { "deletedAt", DateTime.UtcNow },
+            { "deletedBy", deletedBy },
+            { "record", record.DeepClone().AsBsonDocument }
+        };
+        await database.GetCollection<BsonDocument>("deleted_records").InsertOneAsync(archive, cancellationToken: cancellationToken);
+
+        var result = await mongoCollection.DeleteOneAsync(Builders<BsonDocument>.Filter.Eq("_id", id), cancellationToken);
+        if (result.DeletedCount != 1)
+            return StatusCode(StatusCodes.Status500InternalServerError, new { success = false, error = "The record was archived but could not be deleted. No retry was performed." });
+
+        relationshipResolver.Invalidate();
+        return Ok(new { success = true, id, collection = normalizedCollection, deleted = true, archived = true });
     }
 
     private static BsonValue ToBsonValue(JsonNode? value)

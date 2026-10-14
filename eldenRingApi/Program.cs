@@ -9,6 +9,8 @@ using System.Diagnostics;
 using MongoDB.Bson;
 using MongoDB.Driver;
 using System.Text;
+using System.Threading.RateLimiting;
+using Microsoft.AspNetCore.RateLimiting;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -71,6 +73,23 @@ builder.Services.AddAuthorization(options =>
     {
         policy.RequireAuthenticatedUser();
         policy.RequireClaim("scope", "api.write");
+    });
+});
+builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+    options.AddPolicy("record-delete", context =>
+    {
+        var partitionKey = context.User.FindFirst(ClaimTypes.Email)?.Value
+            ?? context.Connection.RemoteIpAddress?.ToString()
+            ?? "anonymous";
+        return RateLimitPartition.GetFixedWindowLimiter(partitionKey, _ => new FixedWindowRateLimiterOptions
+        {
+            PermitLimit = 5,
+            Window = TimeSpan.FromHours(1),
+            QueueLimit = 0,
+            AutoReplenishment = true
+        });
     });
 });
 builder.Services.AddSingleton<IMongoClient>(_ => new MongoClient(mongoConnectionString));
@@ -152,6 +171,7 @@ app.UseHttpsRedirection();
 
 app.UseAuthentication();
 app.UseAuthorization();
+app.UseRateLimiter();
 
 // All future write endpoints are protected even if an endpoint omits [Authorize].
 app.Use(async (context, next) =>
