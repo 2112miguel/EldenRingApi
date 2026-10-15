@@ -179,18 +179,26 @@ public sealed class GuidesController(IMongoDatabase database, IRecordRelationshi
         if (request.Sections?.Any(section => section.Subsections?.Any(subsection => string.IsNullOrWhiteSpace(subsection.Title) || string.IsNullOrWhiteSpace(subsection.Content)) == true) == true)
             return "Every subsection requires title and content.";
         if (request.Supplements?.Any(supplement =>
+                supplement.Order < 1 ||
                 string.IsNullOrWhiteSpace(supplement.Id) ||
                 string.IsNullOrWhiteSpace(supplement.Title) ||
                 string.IsNullOrWhiteSpace(supplement.Content) ||
                 string.IsNullOrWhiteSpace(supplement.Type) ||
                 !SupplementTypes.Contains(supplement.Type)) == true)
-            return "Every supplement requires id, title, content, and a valid type.";
+            return "Every supplement requires a positive order, id, title, content, and a valid type.";
         if (request.Supplements?.GroupBy(supplement => supplement.Id!, StringComparer.OrdinalIgnoreCase).Any(group => group.Count() > 1) == true)
             return "Supplement id values must be unique within a guide.";
+        if (request.Supplements?.GroupBy(supplement => supplement.Order).Any(group => group.Count() > 1) == true)
+            return "Supplement order values must be unique within a guide.";
+        if (request.Supplements?.Any(supplement => supplement.Subsections?.GroupBy(subsection => subsection.Order).Any(group => group.Key < 1 || group.Count() > 1) == true) == true)
+            return "Supplement subsection order values must be positive and unique within a supplement.";
+        if (request.Supplements?.Any(supplement => supplement.Subsections?.Any(subsection => string.IsNullOrWhiteSpace(subsection.Title) || string.IsNullOrWhiteSpace(subsection.Content)) == true) == true)
+            return "Every supplement subsection requires title and content.";
         var references = (request.Subject is null ? Enumerable.Empty<GuideReference>() : new[] { request.Subject })
             .Concat((request.Sections ?? []).SelectMany(section => section.References ?? []))
             .Concat((request.Sections ?? []).SelectMany(section => section.Subsections ?? []).SelectMany(subsection => subsection.References ?? []))
-            .Concat((request.Supplements ?? []).SelectMany(supplement => supplement.References ?? []));
+            .Concat((request.Supplements ?? []).SelectMany(supplement => supplement.References ?? []))
+            .Concat((request.Supplements ?? []).SelectMany(supplement => supplement.Subsections ?? []).SelectMany(subsection => subsection.References ?? []));
         foreach (var reference in references)
         {
             if (reference.Collection is null || reference.Id is null || !ContentCollections.Contains(reference.Collection) || string.IsNullOrWhiteSpace(reference.Id)) return "Each reference requires a valid collection and id.";
@@ -222,12 +230,18 @@ public sealed class GuidesController(IMongoDatabase database, IRecordRelationshi
                         { "references", new BsonArray((subsection.References ?? []).Select(ReferenceDocument)) }
                     })) }
             })) },
-        { "supplements", new BsonArray((request.Supplements ?? []).Select(supplement => new BsonDocument
+        { "supplements", new BsonArray((request.Supplements ?? []).OrderBy(supplement => supplement.Order).Select(supplement => new BsonDocument
             {
-                { "id", supplement.Id!.Trim() }, { "type", supplement.Type!.Trim().ToLowerInvariant() },
+                { "id", supplement.Id!.Trim() }, { "order", supplement.Order }, { "type", supplement.Type!.Trim().ToLowerInvariant() },
                 { "title", supplement.Title!.Trim() }, { "content", supplement.Content!.Trim() },
                 { "image", string.IsNullOrWhiteSpace(supplement.Image) ? BsonNull.Value : new BsonString(supplement.Image.Trim()) },
-                { "references", new BsonArray((supplement.References ?? []).Select(ReferenceDocument)) }
+                { "references", new BsonArray((supplement.References ?? []).Select(ReferenceDocument)) },
+                { "subsections", new BsonArray((supplement.Subsections ?? []).OrderBy(subsection => subsection.Order).Select(subsection => new BsonDocument
+                    {
+                        { "order", subsection.Order }, { "title", subsection.Title! }, { "content", subsection.Content! },
+                        { "image", string.IsNullOrWhiteSpace(subsection.Image) ? BsonNull.Value : new BsonString(subsection.Image.Trim()) },
+                        { "references", new BsonArray((subsection.References ?? []).Select(ReferenceDocument)) }
+                    })) }
             })) },
         { "media", new BsonArray((request.Media ?? []).Select(media => new BsonDocument { { "type", media.Type ?? "image" }, { "url", media.Url ?? string.Empty }, { "alt", media.Alt ?? string.Empty } })) },
         { "createdAt", createdAt ?? BsonDateTime.Create(DateTime.UtcNow) }, { "updatedAt", DateTime.UtcNow }
@@ -250,7 +264,16 @@ public sealed class GuidesController(IMongoDatabase database, IRecordRelationshi
             }
         if (guide["supplements"] is JsonArray supplements)
             foreach (var supplement in supplements.OfType<JsonObject>())
+            {
                 await EnrichReferencesAsync(supplement["references"] as JsonArray, cancellationToken);
+                SetAutomaticImage(supplement);
+                if (supplement["subsections"] is JsonArray subsections)
+                    foreach (var subsection in subsections.OfType<JsonObject>())
+                    {
+                        await EnrichReferencesAsync(subsection["references"] as JsonArray, cancellationToken);
+                        SetAutomaticImage(subsection);
+                    }
+            }
 
         guide["coverImage"] = GetCoverImage(document);
         return guide;
@@ -288,6 +311,19 @@ public sealed class GuidesController(IMongoDatabase database, IRecordRelationshi
             .Where(value => value.IsBsonDocument)
             .Select(value => value.AsBsonDocument.GetValue("url", BsonNull.Value))
             .FirstOrDefault(url => url.IsString && !string.IsNullOrWhiteSpace(url.AsString))?.AsString;
+    }
+
+    private static void SetAutomaticImage(JsonObject content)
+    {
+        if (content["image"] is JsonValue existing && existing.TryGetValue<string>(out var currentImage) && !string.IsNullOrWhiteSpace(currentImage)) return;
+        if (content["references"] is not JsonArray references) return;
+
+        var image = references.OfType<JsonObject>()
+            .Select(reference => reference["image"])
+            .OfType<JsonValue>()
+            .Select(value => value.TryGetValue<string>(out var url) ? url : null)
+            .FirstOrDefault(url => !string.IsNullOrWhiteSpace(url));
+        content["image"] = image;
     }
 
     private static JsonArray ToJsonArray(BsonValue value) => JsonNode.Parse(value.ToJson(new JsonWriterSettings { OutputMode = JsonOutputMode.RelaxedExtendedJson }))!.AsArray();
