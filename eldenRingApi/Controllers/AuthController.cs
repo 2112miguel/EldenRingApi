@@ -5,22 +5,31 @@ using eldenRingApi.Contracts;
 using eldenRingApi.Interfaces;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.IdentityModel.Tokens;
 
 namespace eldenRingApi.Controllers;
 
 [ApiController, Route("api/auth")]
-public sealed class AuthController(IConfiguration configuration, IAuthService authService) : ControllerBase
+public sealed class AuthController(
+    IConfiguration configuration,
+    IAuthService authService,
+    ILogger<AuthController> logger) : ControllerBase
 {
-    [AllowAnonymous, HttpPost("token")]
+    [AllowAnonymous, EnableRateLimiting("auth-login"), HttpPost("token")]
     public async Task<IActionResult> CreateToken([FromBody] AdminLoginRequest request)
     {
         var user = await authService.AuthenticateAsync(request.Email, request.Password, HttpContext.RequestAborted);
         if (user is null)
         {
+            logger.LogWarning(
+                "Authentication failed from {IpAddress}. TraceId: {TraceId}",
+                HttpContext.Connection.RemoteIpAddress,
+                HttpContext.TraceIdentifier);
             return Unauthorized(new { success = false });
         }
 
+        logger.LogInformation("Authentication succeeded. TraceId: {TraceId}", HttpContext.TraceIdentifier);
         return CreateTokenResponse(user);
     }
 

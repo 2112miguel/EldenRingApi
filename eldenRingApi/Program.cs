@@ -10,6 +10,7 @@ using MongoDB.Bson;
 using MongoDB.Driver;
 using System.Text;
 using System.Threading.RateLimiting;
+using System.Globalization;
 using Microsoft.AspNetCore.RateLimiting;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -78,6 +79,58 @@ builder.Services.AddAuthorization(options =>
 builder.Services.AddRateLimiter(options =>
 {
     options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+    options.OnRejected = async (context, cancellationToken) =>
+    {
+        var response = context.HttpContext.Response;
+        if (context.Lease.TryGetMetadata(MetadataName.RetryAfter, out var retryAfter))
+            response.Headers["Retry-After"] = Math.Ceiling(retryAfter.TotalSeconds).ToString(CultureInfo.InvariantCulture);
+
+        var logger = context.HttpContext.RequestServices.GetRequiredService<ILoggerFactory>()
+            .CreateLogger("RateLimiting");
+        logger.LogWarning(
+            "Rate limit rejected {Method} {Path}. TraceId: {TraceId}",
+            context.HttpContext.Request.Method,
+            context.HttpContext.Request.Path,
+            context.HttpContext.TraceIdentifier);
+        await response.WriteAsJsonAsync(new
+        {
+            success = false,
+            error = "Too many requests. Please retry later.",
+            traceId = context.HttpContext.TraceIdentifier
+        }, cancellationToken);
+    };
+
+    var globalPermitLimit = builder.Configuration.GetValue("RateLimiting:Global:PermitLimit", 120);
+    var globalWindowSeconds = builder.Configuration.GetValue("RateLimiting:Global:WindowSeconds", 60);
+    options.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>(context =>
+    {
+        var email = context.User.FindFirst(ClaimTypes.Email)?.Value;
+        var partitionKey = !string.IsNullOrWhiteSpace(email)
+            ? $"user:{email}"
+            : $"ip:{context.Connection.RemoteIpAddress?.ToString() ?? "unknown"}";
+        return RateLimitPartition.GetFixedWindowLimiter(partitionKey, _ => new FixedWindowRateLimiterOptions
+        {
+            PermitLimit = globalPermitLimit,
+            Window = TimeSpan.FromSeconds(globalWindowSeconds),
+            QueueLimit = 0,
+            AutoReplenishment = true
+        });
+    });
+
+    var loginPermitLimit = builder.Configuration.GetValue("RateLimiting:Login:PermitLimit", 5);
+    var loginWindowMinutes = builder.Configuration.GetValue("RateLimiting:Login:WindowMinutes", 15);
+    options.AddPolicy("auth-login", context =>
+    {
+        var partitionKey = context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+        return RateLimitPartition.GetFixedWindowLimiter($"login:{partitionKey}", _ => new FixedWindowRateLimiterOptions
+        {
+            PermitLimit = loginPermitLimit,
+            Window = TimeSpan.FromMinutes(loginWindowMinutes),
+            QueueLimit = 0,
+            AutoReplenishment = true
+        });
+    });
+
     options.AddPolicy("record-delete", context =>
     {
         var partitionKey = context.User.FindFirst(ClaimTypes.Email)?.Value
