@@ -1,4 +1,5 @@
 using System.Text.Json.Nodes;
+using System.Text.Json;
 using eldenRingApi.Contracts;
 using eldenRingApi.Interfaces;
 using Microsoft.AspNetCore.Authorization;
@@ -10,7 +11,10 @@ using MongoDB.Driver;
 namespace eldenRingApi.Controllers;
 
 [ApiController, Route("api/guides")]
-public sealed class GuidesController(IMongoDatabase database, IRecordRelationshipResolver relationshipResolver) : ControllerBase
+public sealed class GuidesController(
+    IMongoDatabase database,
+    IRecordRelationshipResolver relationshipResolver,
+    ILogger<GuidesController> logger) : ControllerBase
 {
     private static readonly HashSet<string> ContentCollections = new(StringComparer.OrdinalIgnoreCase)
     { "ammos", "armors", "ashes", "bosses", "classes", "creatures", "incantations", "items", "locations", "npcs", "shields", "sorceries", "spirits", "talismans", "weapons" };
@@ -151,14 +155,29 @@ public sealed class GuidesController(IMongoDatabase database, IRecordRelationshi
     [Authorize(Policy = "AdminWrite"), HttpPatch("{id}")]
     public async Task<IActionResult> Update(string id, [FromBody] GuideRequest request, CancellationToken cancellationToken)
     {
+        logger.LogInformation("Guide PATCH received for {GuideId}. Payload: {Payload}", id, JsonSerializer.Serialize(request));
         var existing = await Guides.Find(Builders<BsonDocument>.Filter.Eq("_id", id)).FirstOrDefaultAsync(cancellationToken);
         if (existing is null) return NotFound(new { success = false });
         var error = await ValidateAsync(request, id, cancellationToken);
         if (error is not null) return BadRequest(new { success = false, error });
         var replacement = ToDocument(id, request, existing.GetValue("createdAt", BsonDateTime.Create(DateTime.UtcNow)));
+        logger.LogInformation("Guide PATCH normalized BSON for {GuideId}: {Document}", id, replacement.ToJson());
         await Guides.ReplaceOneAsync(Builders<BsonDocument>.Filter.Eq("_id", id), replacement, cancellationToken: cancellationToken);
         relationshipResolver.Invalidate();
-        return Ok(new { success = true, id, data = await ToEnrichedJsonAsync(replacement, cancellationToken) });
+
+        var persisted = await Guides.Find(Builders<BsonDocument>.Filter.Eq("_id", id)).FirstOrDefaultAsync(cancellationToken);
+        if (persisted is null)
+            return StatusCode(StatusCodes.Status500InternalServerError, new { success = false, error = "Guide could not be read after saving." });
+
+        var persistedJson = ToJson(persisted);
+        var persistedSubsubsections = persistedJson["supplements"]?[0]?["subsections"]?[0]?["subsections"];
+        logger.LogInformation(
+            "Guide PATCH persisted document for {GuideId}: {Document}. supplements[0].subsections[0].subsections: {Subsubsections}",
+            id,
+            persistedJson.ToJsonString(),
+            persistedSubsubsections?.ToJsonString() ?? "null");
+
+        return Ok(new { success = true, id, data = await ToEnrichedJsonAsync(persisted, cancellationToken) });
     }
 
     private IMongoCollection<BsonDocument> Guides => database.GetCollection<BsonDocument>("guides");
@@ -190,20 +209,21 @@ public sealed class GuidesController(IMongoDatabase database, IRecordRelationshi
             return "Supplement id values must be unique within a guide.";
         if (request.Supplements?.GroupBy(supplement => supplement.Order).Any(group => group.Count() > 1) == true)
             return "Supplement order values must be unique within a guide.";
-        if (request.Supplements?.Any(supplement => supplement.Subsections?.GroupBy(subsection => subsection.Order).Any(group => group.Key < 1 || group.Count() > 1) == true) == true)
-            return "Supplement subsection order values must be positive and unique within a supplement.";
-        if (request.Supplements?.Any(supplement => supplement.Subsections?.Any(subsection => string.IsNullOrWhiteSpace(subsection.Title) || string.IsNullOrWhiteSpace(subsection.Content)) == true) == true)
-            return "Every supplement subsection requires title and content.";
-        var references = (request.Subject is null ? Enumerable.Empty<GuideReference>() : new[] { request.Subject })
-            .Concat((request.Sections ?? []).SelectMany(section => section.References ?? []))
-            .Concat((request.Sections ?? []).SelectMany(section => section.Subsections ?? []).SelectMany(subsection => subsection.References ?? []))
-            .Concat((request.Supplements ?? []).SelectMany(supplement => supplement.References ?? []))
-            .Concat((request.Supplements ?? []).SelectMany(supplement => supplement.Subsections ?? []).SelectMany(subsection => subsection.References ?? []));
-        foreach (var reference in references)
+        for (var supplementIndex = 0; supplementIndex < (request.Supplements?.Count ?? 0); supplementIndex++)
         {
-            if (reference.Collection is null || reference.Id is null || !ContentCollections.Contains(reference.Collection) || string.IsNullOrWhiteSpace(reference.Id)) return "Each reference requires a valid collection and id.";
+            var supplement = request.Supplements![supplementIndex];
+            var subsectionError = ValidateSupplementSubsections(
+                supplement.Subsections,
+                depth: 1,
+                path: $"supplements[{supplementIndex}].subsections");
+            if (subsectionError is not null) return subsectionError;
+        }
+        foreach (var (reference, path) in EnumerateReferences(request))
+        {
+            if (reference.Collection is null || reference.Id is null || !ContentCollections.Contains(reference.Collection) || string.IsNullOrWhiteSpace(reference.Id))
+                return $"{path} requires a valid collection and id.";
             var exists = await database.GetCollection<BsonDocument>(reference.Collection.ToLowerInvariant()).Find(Builders<BsonDocument>.Filter.Eq("_id", reference.Id)).AnyAsync(cancellationToken);
-            if (!exists) return $"Referenced record was not found: {reference.Collection}/{reference.Id}.";
+            if (!exists) return $"{path} record was not found: {reference.Collection}/{reference.Id}.";
         }
         if (request.Subject is not null)
         {
@@ -212,6 +232,86 @@ public sealed class GuidesController(IMongoDatabase database, IRecordRelationshi
             if (await Guides.Find(duplicateFilter).AnyAsync(cancellationToken)) return "A guide already exists for this record.";
         }
         return null;
+    }
+
+    private static string? ValidateSupplementSubsections(
+        IEnumerable<GuideSupplementSubsection>? subsections,
+        int depth,
+        string path)
+    {
+        var nodes = subsections?.ToList() ?? [];
+        if (nodes.Count == 0) return null;
+        if (depth > 2) return $"{path} exceeds the maximum depth: supplement → subsection → subsubsection.";
+        if (nodes.GroupBy(subsection => subsection.Order).Any(group => group.Key < 1 || group.Count() > 1))
+            return $"{path} must use positive and unique order values among siblings.";
+
+        for (var index = 0; index < nodes.Count; index++)
+        {
+            var subsection = nodes[index];
+            var subsectionPath = $"{path}[{index}]";
+            if (string.IsNullOrWhiteSpace(subsection.Title) || string.IsNullOrWhiteSpace(subsection.Content))
+                return $"{subsectionPath} requires title and content.";
+
+            var error = ValidateSupplementSubsections(
+                subsection.Subsections,
+                depth + 1,
+                $"{subsectionPath}.subsections");
+            if (error is not null) return error;
+        }
+        return null;
+    }
+
+    private static IEnumerable<GuideSupplementSubsection> EnumerateSupplementSubsections(IEnumerable<GuideSupplementSubsection>? subsections)
+    {
+        foreach (var subsection in subsections ?? [])
+        {
+            yield return subsection;
+            foreach (var nested in EnumerateSupplementSubsections(subsection.Subsections))
+                yield return nested;
+        }
+    }
+
+    private static IEnumerable<(GuideReference Reference, string Path)> EnumerateReferences(GuideRequest request)
+    {
+        if (request.Subject is not null) yield return (request.Subject, "subject");
+
+        for (var sectionIndex = 0; sectionIndex < (request.Sections?.Count ?? 0); sectionIndex++)
+        {
+            var section = request.Sections![sectionIndex];
+            for (var referenceIndex = 0; referenceIndex < (section.References?.Count ?? 0); referenceIndex++)
+                yield return (section.References![referenceIndex], $"sections[{sectionIndex}].references[{referenceIndex}]");
+            for (var subsectionIndex = 0; subsectionIndex < (section.Subsections?.Count ?? 0); subsectionIndex++)
+            {
+                var subsection = section.Subsections![subsectionIndex];
+                for (var referenceIndex = 0; referenceIndex < (subsection.References?.Count ?? 0); referenceIndex++)
+                    yield return (subsection.References![referenceIndex], $"sections[{sectionIndex}].subsections[{subsectionIndex}].references[{referenceIndex}]");
+            }
+        }
+
+        for (var supplementIndex = 0; supplementIndex < (request.Supplements?.Count ?? 0); supplementIndex++)
+        {
+            var supplement = request.Supplements![supplementIndex];
+            for (var referenceIndex = 0; referenceIndex < (supplement.References?.Count ?? 0); referenceIndex++)
+                yield return (supplement.References![referenceIndex], $"supplements[{supplementIndex}].references[{referenceIndex}]");
+            foreach (var reference in EnumerateSupplementSubsectionReferences(supplement.Subsections, $"supplements[{supplementIndex}].subsections"))
+                yield return reference;
+        }
+    }
+
+    private static IEnumerable<(GuideReference Reference, string Path)> EnumerateSupplementSubsectionReferences(
+        IEnumerable<GuideSupplementSubsection>? subsections,
+        string path)
+    {
+        var nodes = subsections?.ToList() ?? [];
+        for (var subsectionIndex = 0; subsectionIndex < nodes.Count; subsectionIndex++)
+        {
+            var subsection = nodes[subsectionIndex];
+            var subsectionPath = $"{path}[{subsectionIndex}]";
+            for (var referenceIndex = 0; referenceIndex < (subsection.References?.Count ?? 0); referenceIndex++)
+                yield return (subsection.References![referenceIndex], $"{subsectionPath}.references[{referenceIndex}]");
+            foreach (var reference in EnumerateSupplementSubsectionReferences(subsection.Subsections, $"{subsectionPath}.subsections"))
+                yield return reference;
+        }
     }
 
     private static BsonDocument ToDocument(string id, GuideRequest request, BsonValue? createdAt) => new()
@@ -236,15 +336,18 @@ public sealed class GuidesController(IMongoDatabase database, IRecordRelationshi
                 { "title", supplement.Title!.Trim() }, { "content", supplement.Content!.Trim() },
                 { "image", string.IsNullOrWhiteSpace(supplement.Image) ? BsonNull.Value : new BsonString(supplement.Image.Trim()) },
                 { "references", new BsonArray((supplement.References ?? []).Select(ReferenceDocument)) },
-                { "subsections", new BsonArray((supplement.Subsections ?? []).OrderBy(subsection => subsection.Order).Select(subsection => new BsonDocument
-                    {
-                        { "order", subsection.Order }, { "title", subsection.Title! }, { "content", subsection.Content! },
-                        { "image", string.IsNullOrWhiteSpace(subsection.Image) ? BsonNull.Value : new BsonString(subsection.Image.Trim()) },
-                        { "references", new BsonArray((subsection.References ?? []).Select(ReferenceDocument)) }
-                    })) }
+                { "subsections", new BsonArray((supplement.Subsections ?? []).OrderBy(subsection => subsection.Order).Select(SupplementSubsectionDocument)) }
             })) },
         { "media", new BsonArray((request.Media ?? []).Select(media => new BsonDocument { { "type", media.Type ?? "image" }, { "url", media.Url ?? string.Empty }, { "alt", media.Alt ?? string.Empty } })) },
         { "createdAt", createdAt ?? BsonDateTime.Create(DateTime.UtcNow) }, { "updatedAt", DateTime.UtcNow }
+    };
+
+    private static BsonDocument SupplementSubsectionDocument(GuideSupplementSubsection subsection) => new()
+    {
+        { "order", subsection.Order }, { "title", subsection.Title! }, { "content", subsection.Content! },
+        { "image", string.IsNullOrWhiteSpace(subsection.Image) ? BsonNull.Value : new BsonString(subsection.Image.Trim()) },
+        { "references", new BsonArray((subsection.References ?? []).Select(ReferenceDocument)) },
+        { "subsections", new BsonArray((subsection.Subsections ?? []).OrderBy(child => child.Order).Select(SupplementSubsectionDocument)) }
     };
 
     private static BsonDocument ReferenceDocument(GuideReference reference) => new() { { "collection", reference.Collection!.Trim().ToLowerInvariant() }, { "id", reference.Id!.Trim() } };
@@ -267,12 +370,7 @@ public sealed class GuidesController(IMongoDatabase database, IRecordRelationshi
             {
                 await EnrichReferencesAsync(supplement["references"] as JsonArray, cancellationToken);
                 SetAutomaticImage(supplement);
-                if (supplement["subsections"] is JsonArray subsections)
-                    foreach (var subsection in subsections.OfType<JsonObject>())
-                    {
-                        await EnrichReferencesAsync(subsection["references"] as JsonArray, cancellationToken);
-                        SetAutomaticImage(subsection);
-                    }
+                await EnrichSupplementSubsectionsAsync(supplement["subsections"] as JsonArray, cancellationToken);
             }
 
         guide["coverImage"] = GetCoverImage(document);
@@ -284,6 +382,17 @@ public sealed class GuidesController(IMongoDatabase database, IRecordRelationshi
         if (references is null) return;
         foreach (var reference in references.OfType<JsonObject>())
             await EnrichReferenceAsync(reference, cancellationToken);
+    }
+
+    private async Task EnrichSupplementSubsectionsAsync(JsonArray? subsections, CancellationToken cancellationToken)
+    {
+        if (subsections is null) return;
+        foreach (var subsection in subsections.OfType<JsonObject>())
+        {
+            await EnrichReferencesAsync(subsection["references"] as JsonArray, cancellationToken);
+            SetAutomaticImage(subsection);
+            await EnrichSupplementSubsectionsAsync(subsection["subsections"] as JsonArray, cancellationToken);
+        }
     }
 
     private async Task EnrichReferenceAsync(JsonObject? reference, CancellationToken cancellationToken)

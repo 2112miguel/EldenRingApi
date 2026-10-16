@@ -15,7 +15,7 @@ public sealed class RecordRelationshipResolver(IMongoDatabase database, IMemoryC
     private static readonly string[] RelatedCollections =
     [
         "bosses", "creatures", "weapons", "ammos", "armors", "shields", "talismans",
-        "items", "spirits", "ashes", "sorceries", "incantations", "locations"
+        "items", "spirits", "ashes", "sorceries", "incantations", "locations", "classes"
     ];
     private static readonly Regex CurrencyPattern = new(@"^\s*(?:\d[\d\s,.]*|\?+)\s+runes?\s*$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
     private static readonly Regex QuotedValuePattern = new("(?:\"(?<double>(?:\\\\.|[^\"])*)\"|'(?<single>(?:\\\\.|[^'])*)')", RegexOptions.CultureInvariant);
@@ -60,13 +60,17 @@ public sealed class RecordRelationshipResolver(IMongoDatabase database, IMemoryC
     private async Task<IEnumerable<RelatedRecord>> LoadCollectionAsync(string collectionName, CancellationToken cancellationToken)
     {
         var collection = database.GetCollection<BsonDocument>(collectionName);
-        var projection = Builders<BsonDocument>.Projection.Include("_id").Include("name");
+        var projection = Builders<BsonDocument>.Projection.Include("_id").Include("name").Include("image");
         var documents = await collection.Find(FilterDefinition<BsonDocument>.Empty)
             .Project<BsonDocument>(projection)
             .ToListAsync(cancellationToken);
         return documents
             .Where(document => document.TryGetValue("_id", out var id) && id.IsString && document.TryGetValue("name", out var name) && name.IsString)
-            .Select(document => new RelatedRecord(collectionName, document["_id"].AsString, document["name"].AsString));
+            .Select(document => new RelatedRecord(
+                collectionName,
+                document["_id"].AsString,
+                document["name"].AsString,
+                document.TryGetValue("image", out var image) && image.IsString ? image.AsString : null));
     }
 
     private async Task<IEnumerable<GuideSummary>> LoadPublishedGuideSummariesAsync(CancellationToken cancellationToken)
@@ -119,6 +123,34 @@ public sealed class RecordRelationshipResolver(IMongoDatabase database, IMemoryC
             }
             record["drops"] = references;
         }
+
+        if (collectionName.Equals("classes", StringComparison.OrdinalIgnoreCase))
+            PopulateStartingEquipment(record, index);
+    }
+
+    private static void PopulateStartingEquipment(JsonObject record, RelationshipIndex index)
+    {
+        if (record["startingEquipment"] is not JsonObject groups) return;
+
+        foreach (var group in groups)
+        {
+            if (group.Value is not JsonArray entries) continue;
+
+            var populatedEntries = new JsonArray();
+            foreach (var entry in entries)
+            {
+                if (entry is not JsonObject reference) continue;
+                var collection = ReadString(reference["collection"]);
+                var id = ReadString(reference["id"]);
+                if (collection is null || id is null || !index.TryFindRecord(collection, id, out var related)) continue;
+
+                var populated = ToJsonReference(related);
+                if (reference["quantity"] is JsonValue quantity && quantity.TryGetValue<int>(out var amount))
+                    populated["quantity"] = amount;
+                populatedEntries.Add(populated);
+            }
+            groups[group.Key] = populatedEntries;
+        }
     }
 
     private static JsonObject ToJsonReference(RelatedRecord record) => new()
@@ -126,7 +158,8 @@ public sealed class RecordRelationshipResolver(IMongoDatabase database, IMemoryC
         ["id"] = record.Id,
         ["collection"] = record.Collection,
         ["name"] = record.Name,
-        ["kind"] = "record"
+        ["kind"] = "record",
+        ["image"] = record.Image
     };
 
     private static string? ReadString(JsonNode? node) => node is JsonValue jsonValue && jsonValue.TryGetValue<string>(out var value) ? value : null;
@@ -149,7 +182,7 @@ public sealed class RecordRelationshipResolver(IMongoDatabase database, IMemoryC
 
     private static string Normalize(string value) => Regex.Replace(value.Trim(), "\\s+", " ");
 
-    private sealed record RelatedRecord(string Collection, string Id, string Name);
+    private sealed record RelatedRecord(string Collection, string Id, string Name, string? Image);
     private sealed record GuideSummary(string Id, string Collection, string RecordId, string Title);
 
     private sealed class RelationshipIndex(IEnumerable<RelatedRecord> records, IEnumerable<GuideSummary> guides)
@@ -163,12 +196,17 @@ public sealed class RecordRelationshipResolver(IMongoDatabase database, IMemoryC
             .GroupBy(record => Normalize(record.Name), StringComparer.OrdinalIgnoreCase)
             .ToDictionary(group => group.Key, group => group.First(), StringComparer.OrdinalIgnoreCase);
 
+        private readonly Dictionary<string, RelatedRecord> _recordsById = records
+            .GroupBy(record => Key(record.Collection, record.Id), StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(group => group.Key, group => group.First(), StringComparer.OrdinalIgnoreCase);
+
         private readonly Dictionary<string, GuideSummary> _guides = guides
             .GroupBy(guide => Key(guide.Collection, guide.RecordId), StringComparer.OrdinalIgnoreCase)
             .ToDictionary(group => group.Key, group => group.First(), StringComparer.OrdinalIgnoreCase);
 
         public bool TryFindLocation(string name, out RelatedRecord record) => _locations.TryGetValue(Normalize(name), out record!);
         public bool TryFindRecord(string name, out RelatedRecord record) => _records.TryGetValue(Normalize(name), out record!);
+        public bool TryFindRecord(string collection, string id, out RelatedRecord record) => _recordsById.TryGetValue(Key(collection, id), out record!);
         public bool TryFindGuide(string collection, string id, out GuideSummary guide) => _guides.TryGetValue(Key(collection, id), out guide!);
         private static string Key(string collection, string id) => $"{collection.Trim().ToLowerInvariant()}:{id}";
     }
